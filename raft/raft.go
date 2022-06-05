@@ -72,17 +72,28 @@ func (r *Raft) applyCommand(req *pb.ApplyCommandRequest) (*pb.ApplyCommandRespon
 
 func (r *Raft) appendEntries(req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
 	// TODO: (A.1) - reply false if term < currentTerm
-	// Log: r.logger.Info("reject append entries since current term is older")
+	term := req.GetTerm()
+	if term < r.currentTerm {
+		r.logger.Info("reject append entries since current term is older")
+		return &pb.AppendEntriesResponse{Term: r.currentTerm, Success: false}, nil
+	}
 
 	// TODO: (A.2)* - reset the `lastHeartbeat`
 	// Description: start from the current line, the current request is a valid RPC
+	r.lastHeartbeat = time.Now()
 
 	// TODO: (A.3) - if RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 	// Hint: use `toFollower` to convert to follower
-	// Log: r.logger.Info("increase term since receive a newer one", zap.Uint64("term", r.currentTerm))
+	if term > r.currentTerm {
+		r.toFollower(term)
+		r.logger.Info("increase term since receive a newer one", zap.Uint64("term", r.currentTerm))
+	}
 
 	// TODO: (A.4) - if AppendEntries RPC received from new leader: convert to follower
-	// Log: r.logger.Info("receive request from leader, fallback to follower", zap.Uint64("term", r.currentTerm))
+	if (r.state != Follower) && (term == r.currentTerm) {
+		r.toFollower(term)
+		r.logger.Info("receive request from leader, fallback to follower", zap.Uint64("term", r.currentTerm))
+	}
 
 	prevLogId := req.GetPrevLogId()
 	prevLogTerm := req.GetPrevLogTerm()
@@ -109,16 +120,22 @@ func (r *Raft) appendEntries(req *pb.AppendEntriesRequest) (*pb.AppendEntriesRes
 
 func (r *Raft) requestVote(req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	// TODO: (A.5) - reply false if term < currentTerm
-	// Log: r.logger.Info("reject request vote since current term is older")
+	term := req.GetTerm()
+	if term < r.currentTerm {
+		r.logger.Info("reject request vote since current term is older")
+		return &pb.RequestVoteResponse{Term: r.currentTerm, VoteGranted: false}, nil
+	}
 
 	// TODO: (A.6) - if RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 	// Hint: use `toFollower` to convert to follower
-	// Log: r.logger.Info("increase term since receive a newer one", zap.Uint64("term", r.currentTerm))
+	if term > r.currentTerm {
+		r.toFollower(term)
+		r.logger.Info("increase term since receive a newer one", zap.Uint64("term", r.currentTerm))
+	}
 
-	if false {
+	if (r.votedFor != 0) && (r.votedFor != req.GetCandidateId()) {
 		// TODO: (A.7) - if votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
 		// Hint: (fix the condition) if already vote for another candidate, reply false
-
 		r.logger.Info("reject since already vote for another candidate",
 			zap.Uint64("term", r.currentTerm),
 			zap.Uint32("votedFor", r.votedFor))
@@ -126,12 +143,12 @@ func (r *Raft) requestVote(req *pb.RequestVoteRequest) (*pb.RequestVoteResponse,
 		return &pb.RequestVoteResponse{Term: r.currentTerm, VoteGranted: false}, nil
 	}
 
-	if false {
+	lastLogId, lastLogTerm := r.getLastLog()
+	if (lastLogTerm > req.GetLastLogTerm()) || (lastLogTerm == req.GetLastLogTerm() && lastLogId > req.GetLastLogId()) {
 		// TODO: (A.7) - if votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote
 		// Hint: (fix the condition) if the local last entry is more up-to-date than the candidate's last entry, reply false
 		// Hint: use `getLastLog` to get the last log entry
 		r.logger.Info("reject since last entry is more up-to-date")
-
 		return &pb.RequestVoteResponse{Term: r.currentTerm, VoteGranted: false}, nil
 	}
 
@@ -142,6 +159,7 @@ func (r *Raft) requestVote(req *pb.RequestVoteRequest) (*pb.RequestVoteResponse,
 
 	// TODO: (A.8)* - reset the `lastHeartbeat`
 	// Description: start from the current line, the current request is a valid RPC
+	r.lastHeartbeat = time.Now()
 
 	return &pb.RequestVoteResponse{Term: r.currentTerm, VoteGranted: true}, nil
 }
@@ -210,7 +228,7 @@ func (r *Raft) runFollower(ctx context.Context) {
 func (r *Raft) handleFollowerHeartbeatTimeout() {
 	// TODO: (A.9) - if election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate
 	// Hint: use `toCandidate` to convert to candidate
-
+	r.toCandidate()
 	r.logger.Info("heartbeat timeout, change state from follower to candidate")
 }
 
@@ -263,6 +281,9 @@ func (r *Raft) voteForSelf(grantedVotes *int) {
 	// TODO: (A.10) increment currentTerm
 	// TODO: (A.10) vote for self
 	// Hint: use `voteFor` to vote for self
+	// r.currentTerm += 1
+	r.voteFor(r.id, true)
+	(*grantedVotes) += 1
 
 	r.logger.Info("vote for self", zap.Uint64("term", r.currentTerm))
 }
@@ -270,9 +291,14 @@ func (r *Raft) voteForSelf(grantedVotes *int) {
 func (r *Raft) broadcastRequestVote(ctx context.Context, voteCh chan *voteResult) {
 	r.logger.Info("broadcast request vote", zap.Uint64("term", r.currentTerm))
 
+	lastLogId, lastLogTerm := r.getLastLog()
 	req := &pb.RequestVoteRequest{
 		// TODO: (A.11) - send RequestVote RPCs to all other servers (set all fields of `req`)
 		// Hint: use `getLastLog` to get the last log entry
+		Term:        r.currentTerm,
+		CandidateId: r.id,
+		LastLogId:   lastLogId,
+		LastLogTerm: lastLogTerm,
 	}
 
 	// TODO: (A.11) - send RequestVote RPCs to all other servers (modify the code to send `RequestVote` RPCs in parallel)
@@ -280,20 +306,27 @@ func (r *Raft) broadcastRequestVote(ctx context.Context, voteCh chan *voteResult
 		peerId := peerId
 		peer := peer
 
-		resp, err := peer.RequestVote(ctx, req)
-		if err != nil {
-			r.logger.Error("fail to send RequestVote RPC", zap.Error(err), zap.Uint32("peer", peerId))
-			return
-		}
+		go func() {
+			resp, err := peer.RequestVote(ctx, req)
+			if err != nil {
+				r.logger.Error("fail to send RequestVote RPC", zap.Error(err), zap.Uint32("peer", peerId))
+				return
+			}
+			voteCh <- &voteResult{RequestVoteResponse: resp, peerId: peerId}
+		}()
 
-		voteCh <- &voteResult{RequestVoteResponse: resp, peerId: peerId}
 	}
 }
 
 func (r *Raft) handleVoteResult(vote *voteResult, grantedVotes *int, votesNeeded int) {
 	// TODO: (A.12) - if RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 	// Hint: use `toFollower` to convert to follower
-	// Log: r.logger.Info("receive new term on RequestVote response, fallback to follower", zap.Uint32("peer", vote.peerId))
+	term := vote.GetTerm()
+	if term > r.currentTerm {
+		r.toFollower(term)
+		r.logger.Info("receive new term on RequestVote response, fallback to follower", zap.Uint32("peer", vote.peerId))
+		return
+	}
 
 	if vote.VoteGranted {
 		(*grantedVotes)++
@@ -301,8 +334,11 @@ func (r *Raft) handleVoteResult(vote *voteResult, grantedVotes *int, votesNeeded
 	}
 
 	// TODO: (A.13) - if votes received from majority of servers: become leader
-	// Log: r.logger.Info("election won", zap.Int("grantedVote", (*grantedVotes)), zap.Uint64("term", r.currentTerm))
 	// Hint: use `toLeader` to convert to leader
+	if (*grantedVotes) >= votesNeeded {
+		r.toLeader()
+		r.logger.Info("election won", zap.Int("grantedVote", (*grantedVotes)), zap.Uint64("term", r.currentTerm))
+	}
 }
 
 // leader related
@@ -357,29 +393,39 @@ func (r *Raft) broadcastAppendEntries(ctx context.Context, appendEntriesResultCh
 		// Hint: set `req` with the correct fields (entries, prevLogId and prevLogTerm MUST be set)
 		// Hint: use `getLog` to get specific log, `getLogs` to get all logs after and include the specific log Id
 		// Log: r.logger.Debug("send append entries", zap.Uint32("peer", peerId), zap.Any("request", req), zap.Int("entries", len(entries)))
-		req := &pb.AppendEntriesRequest{}
+		req := &pb.AppendEntriesRequest{
+			Term:           r.currentTerm,
+			LeaderId:       r.id,
+			LeaderCommitId: r.commitIndex,
+		}
 
 		// TODO: (A.14) & (B.6)
 		// Hint: modify the code to send `AppendEntries` RPCs in parallel
-		resp, err := peer.AppendEntries(ctx, req)
-		if err != nil {
-			r.logger.Error("fail to send AppendEntries RPC", zap.Error(err), zap.Uint32("peer", peerId))
-			// connection issue, should not be handled
-			return
-		}
-
-		appendEntriesResultCh <- &appendEntriesResult{
-			AppendEntriesResponse: resp,
-			req:                   req,
-			peerId:                peerId,
-		}
+		go func() {
+			resp, err := peer.AppendEntries(ctx, req)
+			if err != nil {
+				r.logger.Error("fail to send AppendEntries RPC", zap.Error(err), zap.Uint32("peer", peerId))
+				// connection issue, should not be handled
+				return
+			}
+			appendEntriesResultCh <- &appendEntriesResult{
+				AppendEntriesResponse: resp,
+				req:                   req,
+				peerId:                peerId,
+			}
+		}()
 	}
 }
 
 func (r *Raft) handleAppendEntriesResult(result *appendEntriesResult) {
 	// TODO: (A.15) - if RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower
 	// Hint: use `toFollower` to convert to follower
-	// Log: r.logger.Info("receive new term on AppendEntries response, fallback to follower", zap.Uint32("peer", result.peerId))
+	term := result.GetTerm()
+	if term > r.currentTerm {
+		r.toFollower(term)
+		r.logger.Info("receive new term on AppendEntries response, fallback to follower", zap.Uint32("peer", result.peerId))
+		return
+	}
 
 	entries := result.req.GetEntries()
 
